@@ -21,41 +21,83 @@ The **StrataCobot** challenge simulates autonomous resource processing in an ext
 
 ---
 
-## 🏗 System Architecture & Implementation
+## 🛠 What Was Created & Configured
 
-### 1. Perception System (`task2A_perception.py`)
-- **Camera Streams**: Subscribes to the overhead Intel RealSense RGB-D camera:
-  - `/camera/camera/color/image_raw` (640×480 BGR colour)
-  - `/camera/camera/aligned_depth_to_color/image_raw` (aligned 32FC1 depth in metres)
-  - `/camera/camera/color/camera_info` (camera intrinsic matrix)
-- **HSV Color Segmentation**: Converts incoming BGR frames to HSV space, filters each ore with tuned color bounds, and applies morphological opening and closing to suppress noise.
-- **Centroid & Depth Sampling**: Calculates spatial moments $(cX, cY)$ for detected contours and extracts the median depth across a $9 \times 9$ pixel patch over the ore's flat top surface.
-- **Pinhole Deprojection**:
+### 1. `task2A_perception.py`
+- Subscribes to the camera topics: `/camera/camera/color/image_raw`, `/camera/camera/aligned_depth_to_color/image_raw`, and `/camera/camera/color/camera_info`.
+- Uses HSV color segmentation and morphological filtering for the three ore types:
+  - **Azurite** (blue)
+  - **Malachite** (green)
+  - **Vanadinite** (orange/red)
+- Samples depth at the centroid of each ore's top face and deprojects pixels into 3D camera coordinates:
   $$X_c = \frac{(cX - c_x) \cdot Z}{f_x}, \quad Y_c = \frac{(cY - c_y) \cdot Z}{f_y}, \quad Z_c = Z$$
-- **Frame Transformation**: Transforms coordinates from `camera_color_optical_frame` into the arm's reference frame `base_link` using tf2 buffer lookups.
-- **Conveyor Region Filtering**: Filters out spurious detections outside the conveyor bounding envelope ($X \in [-0.90, 0.35], Y \in [-0.75, -0.30], Z \in [0.10, 0.30]$).
-- **Persistent Tracking & TF Broadcasting**: Continuously publishes tf2 transforms (`<ore_type>_<id>`, e.g., `azurite_ore_1`, `malachite_ore_1`) with `base_link` as the parent frame. Unmatched detections get sequentially assigned IDs. Broadcast automatically stops once an ore is picked up and lifted off the conveyor.
+- Transforms positions to `base_link` and filters detections bounded within the conveyor volume ($X \in [-0.90, 0.35], Y \in [-0.75, -0.30], Z \in [0.10, 0.30]$).
+- Implements persistent ID tracking (`<kind>_1`, `<kind>_2`) and continuously broadcasts `TransformStamped` frames on `/tf`.
+- Naturally stops publishing when an ore is picked up and lifted off the conveyor.
 
-### 2. Arm Manipulation & Control (`task2A_manipulation.py`)
-- **Cartesian Velocity Servo**: Publishes `geometry_msgs/msg/TwistStamped` on `/delta_twist_cmds` at 20 Hz, safely below hardware caps ($v_{max} = 0.10\text{ m/s} < 0.15\text{ m/s}$, $\omega_{max} = 0.20\text{ rad/s} < 0.35\text{ rad/s}$).
-- **Active Controller Management**: Interacts with `/ur_arm_controller/switch_controller` to switch between `delta_joint_controller` and `delta_twist_controller`.
-- **Tool Orientation Alignment**: Enforces the magnetic tool axis ($Z$-axis of TCP) to point vertically downward ($[0, 0, -1]$ in `base_link`) using axis-angle proportional rotation control:
+### 2. `task2A_manipulation.py`
+- Coordinates with `delta_twist_controller` via `/delta_twist_cmds` at 20 Hz, safely below the velocity caps (0.10 m/s linear, 0.20 rad/s angular).
+- Keeps the magnetic tool oriented strictly vertically downward towards the conveyor and containers at all times using axis-angle alignment:
   $$\vec{c} = \vec{a} \times \vec{b}, \quad \theta = \text{atan2}(\|\vec{c}\|, \vec{a} \cdot \vec{b}), \quad \vec{\omega} = K_{rot} \cdot \theta \cdot \frac{\vec{c}}{\|\vec{c}\|}$$
-- **State Machine Workflow**:
-  1. `INIT_WAIT`: Ensures controller activation, initializes magnet to OFF, and waits for stable ore detection.
-  2. `FIND_NEXT_ORE`: Discovers active ore transforms via TF and plans the next target.
-  3. `MOVE_HOVER_ORE`: Approaches pre-pick waypoint ($Z = 0.35\text{ m}$).
-  4. `DESCEND_PICK`: Descents gently ($v \le 0.035\text{ m/s}$) until contact is confirmed via force sensor (`/ur7e/end_effector/force_magnitude` $> 1.0\text{ N}$) or vertical threshold.
-  5. `WAIT_MAGNET`: Calls `/magnet` service (`data=True`) and confirms grip.
-  6. `LIFT_ORE`: Ascends vertically to $Z = 0.38\text{ m}$ off the conveyor.
-  7. `TRANSIT_CONTAINER`: Traverses via intermediate safety corridor waypoint `[-0.8000, 0.0000, 0.4000]` to avoid arm self-collision or base collision.
-  8. `MOVE_HOVER_CONTAINER`: Positions over the matching container ($Z = 0.35\text{ m}$).
-  9. `DESCEND_CONTAINER`: Lowers to release height ($Z = 0.23\text{ m}$).
-  10. `RELEASE_ORE`: Calls `/magnet` (`data=False`), waits $0.8\text{ s}$ for ore to settle inside container, and marks ore as completed.
-  11. `ASCEND_CONTAINER`: Ascends safely back to $Z = 0.38\text{ m}$.
-  12. `TRANSIT_CONVEYOR`: Returns via transit waypoint to repeat for all 4 ores.
-  13. `ALL_DONE`: Parks arm safely and holds pose.
-- **Protective Stop Recovery**: Listens to `/arm_status` codes $20$–$23$ and automatically issues `/ur_arm_controller/unlock_protective_stop` requests.
+- Queries `/tf` for detected ores and routes each ore to its designated container on the cargo rover:
+  - **Azurite**: Farthest container (`x = -0.7430, y = 0.5280, z = 0.2300`)
+  - **Malachite**: Middle container (`x = -0.4097, y = 0.5280, z = 0.2300`)
+  - **Vanadinite**: Nearest container (`x = -0.0763, y = 0.5280, z = 0.2300`)
+- Uses a safe transit waypoint (`[-0.8000, 0.0000, 0.4000]`) between the conveyor and the cargo rover to avoid singularities and base collisions.
+- Monitors force feedback on `/ur7e/end_effector/force_magnitude` and coordinates `/magnet` engagement/release.
+- Listens to `/arm_status` and triggers `/ur_arm_controller/unlock_protective_stop` if a protective stop occurs.
+
+### 3. `setup.py`
+- Registered both scripts in the `SCRIPTS` array of `algorithms/setup.py`:
+  ```python
+  SCRIPTS = [
+      'scripts/task2a/task2A_perception.py',
+      'scripts/task2a/task2A_manipulation.py',
+  ]
+  ```
+
+---
+
+## 🚀 Running & Evaluating Task 2A
+
+In your Ubuntu 24.04 environment (with ROS 2 Jazzy and Gazebo Harmonic sourced):
+
+### 1. Build and install the nodes
+```bash
+cd ~/ros2_ws   # or the path containing eYRC_26-27_Strata-Cobot
+colcon build --packages-select algorithms
+source install/setup.bash
+ros2 pkg executables algorithms
+```
+
+### 2. Terminal 1 — Start the simulation world
+```bash
+ros2 launch eyantra_kepler_colony task2a.launch.py
+```
+Wait until Gazebo and RViz open and print:
+```text
+[launch.user]: Task 2A world ready: Start your nodes now.
+```
+
+### 3. Terminal 2 — Run the evaluator (for scoring/submission)
+```bash
+./eyrc-sc-evaluator --task 2A --team-id <YOUR_TEAM_ID>
+```
+Wait until the evaluator prints `Ready`.
+
+### 4. Terminals 3 & 4 — Run your nodes
+In Terminal 3:
+```bash
+ros2 run algorithms task2A_perception.py
+```
+
+In Terminal 4:
+```bash
+ros2 run algorithms task2A_manipulation.py
+```
+
+### 5. Complete & Save Run
+Once all 4 ores have been picked, placed, and have settled in their respective containers, press `q` in the evaluator terminal. The evaluator will generate `result.zip` for submission.
 
 ---
 
@@ -82,62 +124,9 @@ eYRC_26-27_Strata-Cobot/
 
 ---
 
-## 🚀 Setup & Execution Guide
+## 🔍 Verification & Monitoring Topics
 
-### Prerequisites
-- **Operating System**: Ubuntu 24.04 LTS
-- **ROS 2 Distribution**: Jazzy Jalisco (`ros-jazzy-desktop-full`)
-- **Simulator**: Gazebo Harmonic (`gz-sim 8`)
-
-### 1. Build the Workspace
-From the workspace root directory:
-```bash
-./requirements.sh
-cd ..
-colcon build --packages-select algorithms
-source install/setup.bash
-```
-
-Confirm both nodes are registered:
-```bash
-ros2 pkg executables algorithms
-```
-*Expected output includes `task2A_perception.py` and `task2A_manipulation.py`.*
-
----
-
-### 2. Running Task 2A
-
-Use separate terminal tabs for each process (ensuring each is sourced with `source install/setup.bash`):
-
-#### Terminal 1 — Start the Kepler World
-```bash
-ros2 launch eyantra_kepler_colony task2a.launch.py
-```
-> Wait until Gazebo and RViz finish loading and print:  
-> `[launch.user]: Task 2A world ready: Start your nodes now.`
-
-#### Terminal 2 — Run the Evaluator
-```bash
-./eyrc-sc-evaluator --task 2A --team-id <YOUR_TEAM_ID>
-```
-> Wait until the evaluator prints `Ready`.
-
-#### Terminal 3 — Run Perception
-```bash
-ros2 run algorithms task2A_perception.py
-```
-
-#### Terminal 4 — Run Arm Manipulation
-```bash
-ros2 run algorithms task2A_manipulation.py
-```
-
----
-
-### 3. Verification & Monitoring
-
-To monitor published transforms:
+To monitor published ore transforms:
 ```bash
 ros2 run tf2_ros tf2_echo base_link azurite_ore_1
 ```
@@ -151,11 +140,3 @@ To monitor arm safety status:
 ```bash
 ros2 topic echo /arm_status
 ```
-
----
-
-### 4. Submission
-When all four ores have settled in their respective containers:
-1. Press `q` in the evaluator terminal.
-2. The evaluator will generate `result.zip`.
-3. Package `result.zip` with `task2A_perception.py` and `task2A_manipulation.py` as specified in the e-Yantra submission portal.
